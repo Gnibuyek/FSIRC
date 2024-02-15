@@ -1,0 +1,611 @@
+/*
+* To change this license header, choose License Headers in Project Properties.
+* To change this template file, choose Tools | Templates
+* and open the template in the editor.
+*/
+
+
+import java.io.BufferedWriter;
+import java.io.FileWriter;
+import java.text.DecimalFormat;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Random;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.regex.Pattern;
+
+import JFlex.Out;
+import weka.core.Instance;
+import weka.core.Instances;
+import weka.filters.Filter;
+import weka.filters.unsupervised.attribute.Remove;
+
+/**
+ * This class is the main class of the DSFS algorithm, which consists of three components,
+ * including intra-feature value outlierness computing (i.e., the delta function in our ICDM2016 paper),
+ * the adjacent matrix of the feature graph, and dense subgraph discovery of the feature graph.
+ * Note that we skip the value graph construction and go directly to construct the feature graph, 
+ * which can speed up the algorithm a bit.
+ * @author Guansong Pang 
+ */
+public class SubgraphDiscovery{
+    
+    private ArrayList<ArrayList<Double>> fMatrix = new ArrayList<ArrayList<Double>>();
+    private ArrayList<ArrayList<Double>> S_fMatrix = new ArrayList<ArrayList<Double>>();
+    private ArrayList<Double> infeScore = new ArrayList<Double>();
+    private ArrayList<Double> featIndWgts = new ArrayList<Double>();   //to store total weights for each feature
+    private ArrayList<Integer> featStatus = new ArrayList<Integer>();   //to record whether the feature has been removed or not
+    private ArrayList<Integer> featIndice = new ArrayList<Integer>();   //to record whether the feature has been removed or not
+    
+    /**
+     * the main method for calling Charikar greedy, sequential backward and Las Vegas based
+     * dense subgraph discovery
+     * @param cpList the list of coupled centroids: each centroid contains the co-occurrence frequency of each value with other values
+     * @return the IDs of features to be removed
+     */
+    public String denseSubgraphDiscovery(ArrayList<CoupledValueCentroid> cpList, Instances data, int dataSize) {
+    	String[] attarray = new String[data.numAttributes()];
+    	double[][] dataMatrix = new double[data.numInstances()][data.numAttributes()];
+    	// 处理非数值型特征
+    	for(int i = 0; i < data.numAttributes(); i++) {
+//    		System.out.println(data.attribute(j));
+    		String attr = data.attribute(i).toString();
+    		String attrvalue = attr.substring(attr.indexOf("{")+1, attr.indexOf("}"));
+//    		int attvnum = (attrvalue.length()+1)/2;
+//    		System.out.print(" length:"+attvnum+" ");
+    		attarray[i] = attrvalue;
+//    		System.out.println(attarray[i]);
+    	}
+        for(int j = 0; j < data.numInstances(); j++) {
+        	Instance inst = data.instance(j);
+//            System.out.println(inst);
+            for(int k = 0; k < inst.numAttributes(); k++) {
+            	String str = inst.stringValue(k).toString();
+              	if(!str.matches("^[0-9]*$")) {
+              	str = String.valueOf(attarray[k].indexOf(str,1)/2);
+              	}
+//            System.out.print(str+",");
+              	
+            Double val = Double.parseDouble(str);
+//            System.out.print(val+",");
+            dataMatrix[j][k] = val;
+            }
+        }
+        
+    	double[] fo = calcIntraFeatureWeight(cpList,dataSize);
+//        adjacentMatrix(cpList);
+        featureAdjacentMatrix(cpList,fo);
+        ArrayList<String> discardFeats = new ArrayList<String>();
+        double[] den = charikarGreedySearchforFeatGraph(discardFeats, dataMatrix);
+//        System.out.println(discardFeats);
+        
+        double max = -Double.MAX_VALUE;
+        int maxID = -1;
+        double avg_den = 0.0;
+        for(int m = 0; m < den.length; m++) {
+        	avg_den += den[m];
+//        	System.out.println("den["+m+"]:"+den[m]);
+        }
+        avg_den = avg_den / den.length;
+        System.out.println("avg_den:"+avg_den);
+//        avg_den = avg_den / den.length * 0.99;
+//        System.out.print("length:"+den.length);
+        label:for(int n = 0; n < den.length; n++) {
+//        	System.out.print(den[n]+",");
+        	if(den[n] > avg_den) {
+        		max = den[n];
+        		maxID = n;
+        		break label;
+        	}
+        }
+
+//    	}
+        System.out.println("Max:"+(new DecimalFormat("#0.0000")).format(max)+" ");
+//        System.out.println("minID:"+minID);
+        Plot.plotYPoints(den, 3, DSFS4ODUtils.dataSetName, DSFS4ODUtils.dataSetName, "Iteration", "Avg. Incoming Edge Weight");
+//        System.out.print(minID+":");
+//        System.out.println(discardFeats.get(minID));
+        StringBuilder temp = new StringBuilder();
+        temp.append(discardFeats.get(maxID));
+        temp.append(discardFeats.size()+1);
+        discardFeats.set(maxID, temp.toString());
+        System.out.println(discardFeats);
+        return discardFeats.get(maxID);
+    }
+   
+    
+    /**
+     * to calculate the outlierness of each feature value based on the extent the value frequent deviating from the mode frequency
+     * @param cpList the list of coupled centroids: each centroid contains the co-occurrence frequency of each value with other values
+     * @param dataSize the number of instances in the data set
+     */
+    public double[] calcIntraFeatureWeight(ArrayList<CoupledValueCentroid> cpList, int dataSize) {
+        int dim = cpList.size();
+        double [] fo = new double[dim];
+        double [] mFreq = new double[dim];
+//        System.out.println();
+        for(int i = 0; i < cpList.size(); i++) {
+            CoupledValueCentroid cp = cpList.get(i);
+            int len = cp.getCenList().size();
+            double maxFreq = 0;
+            for(int j = 0; j < len; j++) {
+//            	  KYB: cp.getCenList() 列数_值域 0_0 0_1 0_2 0_3 0_4 0_5 1_0 1_1 1_2 1_3
+                ValueCentroid cen = cp.getCenList().get(j);
+//                KYB:globalFreq(列数,值)=出现次数
+                double globalFreq = cen.globalFreq(i, j);
+//                System.out.print("globalfreq("+i+","+j+"):"+globalFreq+", ");
+                if(globalFreq > maxFreq)
+                    maxFreq = globalFreq;
+            }
+            mFreq[i] = maxFreq;
+            fo[i] = 0;
+            
+        }
+//        System.out.println();
+//        KYB: fo[]=0
+        double max = Double.MIN_VALUE;
+        double min = Double.MAX_VALUE;
+        for(int i = 0; i < cpList.size(); i++) {
+            CoupledValueCentroid cp = cpList.get(i);
+            int len = cp.getCenList().size();
+            int count = 0;
+            for(int j = 0; j < len; j++) {
+                ValueCentroid cen = cp.getCenList().get(j);
+                double globalFreq = cen.globalFreq(i, j);
+                if(globalFreq == 0) {
+                    continue;
+                }
+                double intra;
+//                特征内部离群分数
+                intra = (Math.abs(globalFreq-mFreq[i])+1.0/dataSize)/(mFreq[i]); //mode absolute difference based. '1.0/dataSize' is used to avoid zero outlierness
+//                System.out.println(intra);
+                cen.setIntraOD(intra);
+                fo[i] = fo[i] + intra;
+                count++;
+            }
+            if(fo[i]>max)
+                max = fo[i];
+            if(fo[i]<min)
+                min = fo[i];
+        }
+        double interval = max - min;
+        // KYB:normalize
+//        System.out.print("normalized fo: ");
+        for(int i = 0; i < dim; i++) {
+            fo[i] = (fo[i] - min)/interval;
+            infeScore.add(fo[i]);
+//            System.out.print(fo[i]+", ");
+        }
+        return fo;
+    }
+    /**
+     * to generate the adjacent matrix for the FEATURE graph
+     * @param cpList the list of coupled centroids: each centroid contains the co-occurrence frequency of each value with other values
+     */
+    public void featureAdjacentMatrix(ArrayList<CoupledValueCentroid> cpList,double[] fo) {
+        int dim = cpList.size();
+        double max = Double.MIN_VALUE;
+        double min = Double.MAX_VALUE;
+        for(int k = 0; k < dim; k++) {
+            ArrayList<Double> col = new ArrayList<Double>();
+            double fWgt=0;
+//            int count = 0;
+            for(int i = 0; i < cpList.size(); i++) {
+                if(i==k) {
+//                    col.add(fo[i]);
+//                    fWgt += fo[i];
+                    col.add(0.0);
+                    continue;
+                }
+                double tmp = 0;
+                CoupledValueCentroid cp = cpList.get(i);
+                for(int j = 0; j < cp.getCenList().size(); j++) {
+                    ValueCentroid cen = cp.getCenList().get(j);
+                    if(cen.globalFreq(i, j) == 0)  //skip feature values that have no occurence
+                        continue;
+                    
+                    FeatureInfo ai = cen.getAttrList().get(k);
+                    FeatureInfo gai = cp.getGlobalCentroid().getAttrList().get(k);
+                    int len = ai.NumofValue();
+                    for(int l=0; l < len; l++) {
+                        if (k==cen.getOrgFeat() && gai.value(l) != 0) { //skip zero-appearance values
+                            continue;
+                        }/**/
+                        double freq = ai.value(l);
+                        double gFreq = gai.value(l);
+                        double cenFreq = cen.globalFreq(i, j);
+                        if(cenFreq != 0 && gFreq != 0) { //skip zero-appearance values
+                            double w = cen.getIntraOD() * cpList.get(k).getCenList().get(l).getIntraOD() * (freq*1.0/cenFreq) 
+                                    + cen.getIntraOD() * cpList.get(k).getCenList().get(l).getIntraOD() * (freq*1.0/gFreq);                            
+                            if(w > 0) {
+//                                wlist.add(w);
+                                tmp += w;
+                            }
+                        }
+                    }
+                }
+                col.add(tmp);
+                if(tmp>max)
+                    max = tmp;
+                if(tmp<min)
+                    min = tmp;
+                fWgt += tmp;
+            }
+            fMatrix.add(col);
+            S_fMatrix.add((ArrayList<Double>) col.clone());
+            featStatus.add(1);
+            featIndice.add(k+1);
+        }
+//        System.out.println("S_fMatrix:");
+//        for(int l=0;l<S_fMatrix.size();l++) {
+//            System.out.println(S_fMatrix.get(l));   	
+//        }
+        double interval = max - min;
+        ArrayList<Double> tmp = new ArrayList<Double>();
+        int len = fMatrix.size();
+        for(int i = 0; i < len; i++) {
+            double d = 0;
+            ArrayList<Double> col = fMatrix.get(i);
+            for(int j = 0; j < len; j++) {
+                if(i == j){
+                    col.add(fo[j]);
+                    d += fo[j];
+//                    System.out.println(fo[j]+",");
+                }
+                double w = (col.get(j)-min)/interval;
+                col.set(j, w);
+                d += w;
+            }
+            tmp.add(d);
+//            System.out.println("col: "+col);
+        }
+        featIndWgts = tmp;
+    }
+    
+    
+    /**
+     * to search for the densest subgraph in indirected graphs by using Charikar's greedy method presented in the paper below
+     * @incollection{charikar2000greedy,
+     * title={Greedy approximation algorithms for finding dense components in a graph},
+     *   author={Charikar, Moses},
+     *   booktitle={Approximation Algorithms for Combinatorial Optimization},
+     *   pages={84--95},
+     *   year={2000},
+     *   publisher={Springer}
+     * }
+     * @param discardFeats the list to store non-relevant feature ids
+     * @return the density array that records all densities of all the subgraphs
+     */
+    public double[] charikarGreedySearchforFeatGraph(ArrayList<String> discardFeats, double[][] dataMatrix) {
+//    	System.out.println(dataMatrix.length);
+    	ArrayList<Double> S = new ArrayList<Double>();
+        int len = featIndWgts.size();
+        int count = len;
+        int id = 0;
+        double[] den = new double[count];
+        double[][] tMatrix = dataMatrix.clone();
+        StringBuilder sb = new StringBuilder();
+        System.out.print("Subgraph densities:");
+//        double[] weight = relief(tMatrix,tMatrix[0].length);
+        while(count > 0) {
+            double density = 0;
+//            density = computeDensity(S, S.size());
+//            discardFeats.add(sb.toString());
+            // search
+            double max = -Double.MAX_VALUE;
+            int mid = -1;
+           
+            for(int i = 0; i < featIndWgts.size(); i++) {
+            	double w = featIndWgts.get(i);
+//            	System.out.println("w:"+w);
+            	if(w > max) {
+            		max = w;
+            		mid = i;
+            	}
+            }
+//            System.out.println("count="+count+",mid="+mid);
+//            System.out.println("sb:"+sb);
+//            System.out.println("featIndice:"+featIndice);
+            double[] weight = relief(tMatrix,tMatrix[0].length);
+            addOneFeature(featIndice.get(mid), S, sb);
+            density = computeDensity(S, S.size());
+            System.out.print((new DecimalFormat("#0.0000")).format(density)+",");
+            den[id++] = density;
+            removeOneFeature(mid);
+            sb.append(featIndice.remove(mid)+",");
+            discardFeats.add(sb.toString());
+//            System.out.println("sb:"+sb);
+//            System.out.println("featIndice:"+featIndice);
+//            System.out.println("discardFeats:"+discardFeats);
+            count--;
+            
+            if(count > 1) {
+            	System.out.println("deleted mid ID:"+mid);
+            	for(int n = mid; n < weight.length-1; n++) {
+                	weight[n] = weight[n+1];
+                	System.out.print((new DecimalFormat("#0.0000")).format(weight[n])+",");
+                }
+            	System.out.println(" over");
+            	
+                tMatrix = delCol(tMatrix, mid);
+//                System.out.println("????"+tMatrix[0].length);
+                double[] rmWeight = relief(tMatrix,tMatrix[0].length);
+                int wId = findCompleFeature(weight, rmWeight, count);
+                
+                if(wId != -1) {
+                	// KYB
+                	ArrayList<Double> tempS = (ArrayList<Double>) S.clone();
+                	addOneFeature(featIndice.get(wId), tempS, sb);
+                	System.out.println(computeDensity(tempS, tempS.size())+" VS "+ computeDensity(S, S.size()));
+                	if(computeDensity(tempS, tempS.size()) > computeDensity(S, S.size())) {
+//                		den[id++] = density;
+//                		System.out.println("come in!!"+featIndice.get(wId));
+                		addOneFeature(featIndice.get(wId), S, sb);
+                        sb.append(featIndice.get(wId)+",");
+//                        discardFeats.add(sb.toString());
+//                        S.add(featIndWgts.get(wId));
+                	}
+                	density = computeDensity(S, S.size());
+                	discardFeats.add(sb.toString());
+                	System.out.print((new DecimalFormat("#0.0000")).format(density)+",");
+                    den[id++] = density;
+                	removeOneFeature(wId);
+                	featIndice.remove(wId);
+//                	for(int n = mid; n < weight.length-1; n++) {
+//                    	weight[n] = weight[n+1];
+//                    }
+                    count--;
+                }
+            
+            }
+        }
+//        System.out.println(den);
+        return den;
+    }
+    
+    public int findCompleFeature(double[] weight, double[] rmWeight, int count){
+    	int id = -1;
+    	double[] deWeight = new double[count-1];
+    	double maxdecre = -Double.MAX_VALUE;
+    	System.out.println("deWeight:");
+    	for(int i = 0; i < count-1; i++) {
+    		deWeight[i] = weight[i] - rmWeight[i];
+//    		System.out.println(weight[i]+"-"+rmWeight[i]);
+    		if(deWeight[i] > maxdecre) {
+    			maxdecre = deWeight[i];
+//    			if(maxdecre > 0) {
+//    				id = i;
+//    			}
+    			id = i ;
+    		}
+    		System.out.print(new DecimalFormat("#0.0000").format(deWeight[i])+",");
+    	}
+    	System.out.println("maxdecre:"+maxdecre+","+"id:"+id+";");
+    	return id;
+    }
+    
+    public double[][] delCol(double[][] matrix, int delColnum){
+    	double[][] nMatrix = new double[matrix.length][matrix[0].length-1];
+    	for(int i = 0; i < matrix.length; i++) {
+    		for(int j = delColnum; j < matrix[0].length-1; j++) {
+    			matrix[i][j] = matrix[i][j+1];
+    		}
+    		for(int k = 0; k < nMatrix[0].length; k++) {
+        		nMatrix[i][k] = matrix[i][k];
+        	}
+    	}
+    	return nMatrix;
+    }
+    
+    // Relief计算权重
+    public double[] relief(double[][] matrix, int n_vars) {
+    	int length = matrix.length;
+    	int width = matrix[0].length-1;
+    	n_vars = n_vars-1;
+//    	System.out.println(width+"!!!");
+    	// 权重置0
+    	double[] weight = new double[n_vars];
+    	for(int i = 0; i < n_vars; i++) {
+    		weight[i] = 0.0;
+    	}
+//    	// 特征的最大值和最小值
+//    	double[] max = new double[n_vars];
+//    	double[] min = new double[n_vars];
+//    	for(int i = 0; i < width; i++) {
+//    		for(int j = 0; j < length; j++) {
+//    			double d = matrix[j][i];
+//    			if(d > max[i]) {
+//    				max[i] = d;
+//    			}
+//    			if(d < min[i]) {
+//    				min[i] = d;
+//    			}
+//    		}
+//    	}
+    	// 遍历样本
+    	for(int i=0; i<length; i++) {
+    		int R_index = i;
+    		double[] R = new double[width];
+    		for(int index = 0; index < width; index++) {
+    			R[index] = matrix[R_index][index];
+    		}
+    		double H_value = 0.0;
+    		double M_value = 0.0;
+    		int H_row = 0;
+    		int M_row = 0;
+//    		double distince = 0.0;
+        	// 特征的最大值和最小值
+    		
+        	double[] max = new double[n_vars];
+        	double[] min = new double[n_vars];
+        	for(int x = 0; x < width; x++) {
+        		for(int j = 0; j < length; j++) {
+        			double d = matrix[j][x];
+        			if(d > max[x]) {
+        				max[x] = d;
+        			}
+        			if(d < min[x]) {
+        				min[x] = d;
+        			}
+        		}
+        	}
+    		
+    		for(int len = 0; len < length; len++) {
+    			double distince = 0.0;
+    			if(len != R_index) {
+    				for(int wid = 0; wid < width-1; wid++) {
+//    					System.out.print(matrix[len][wid]+"?="+R[wid]);
+    					if(matrix[len][wid] != R[wid]) {
+//    						distince += Math.pow(R[wid]-matrix[len][wid], 2);
+    						distince += 1.0;
+    					}
+    				}
+//    				distince = Math.sqrt(distince);
+//    				System.out.println("!!!!"+i+":"+distince);
+    				if(matrix[len][width-1] == matrix[len][width-1]) {
+    					if(len == 0) {
+        					H_value = distince;
+        				}
+    					if(distince < H_value) {
+    						H_value = distince;
+    						H_row = len;
+    					}
+    				}
+    				if(matrix[len][width-1] != matrix[len][width-1]) {
+    					if(len == 0) {
+        					M_value = distince;
+        				}
+    					if(distince < M_value) {
+    						M_value = distince;
+    						M_row = len;
+    					}
+    				}
+    			}
+    		}
+//    		if(H_value!=0.0 || M_value!=0.0) {
+//    			System.out.println("H_value:"+H_value+";M_value:"+M_value);
+//    		}
+    		double[] H = new double[width];
+    		for(int index = 0; index < width; index++) {
+    			H[index] = matrix[H_row][index];
+    		}
+    		double[] M = new double[width];
+    		for(int index = 0; index < width; index++) {
+    			M[index] = matrix[M_row][index];
+    		}
+    		
+    		for(int j = 0; j < n_vars; j++) {
+//				weight[j] = weight[j]-(Math.abs(R[j]-H[j])/(max[j]-min[j]))/(double)length + (Math.abs(R[j]-M[j])/(max[j]-min[j]))/(double)length; 
+//				weight[j] = weight[j]- (H[j]==R[j]?0.0:1.0)/(double)length + (M[j]==R[j]?0.0:1.0)/(double)length;
+    			
+				weight[j] = weight[j]-((H[j]==R[j]?0.0:1.0)/(max[j]-min[j]))/length + ((M[j]==R[j]?0.0:1.0)/(max[j]-min[j]))/length; 
+				
+//				weight[j] = weight[j]- (H[j]==R[j]?0.0:1.0) + (M[j]==R[j]?0.0:1.0);
+//				System.out.println("-"+(H[j]==R[j]?0:1)+"+"+(M[j]==R[j]?0:1));
+//				System.out.print(new DecimalFormat("#0.0000").format(weight[j])+",");
+			}
+//    		System.out.println();
+    	}
+//    	System.out.print("Relief:[");
+//    	for(int i = 0; i < width; i++) {
+//    		System.out.print(new DecimalFormat("#0.0000").format(weight[i])+",");
+//    	}
+//    	System.out.println("]");
+    	return weight;
+	}
+    
+    /**
+     * to remove one feature from the feature candidates
+     * @param fid the id of the feature to be removed
+     */    
+    public void removeOneFeature(int fid) {
+//    	System.out.println();
+//    	System.out.println("fMatrix:"+fMatrix);
+        fMatrix.remove(fid);
+        featIndWgts.remove(fid); //virtually remove the feature
+//            double fWgt = featIndWgts.get(fid);
+        for(int k = 0; k < fMatrix.size(); k++) {
+            ArrayList<Double> col = fMatrix.get(k);
+            double fWgt = featIndWgts.get(k);
+            
+            double w = col.remove(fid);
+//                double w = col.get(fid);
+//            System.out.println("fWgt="+fWgt+",w="+w);
+            featIndWgts.set(k, fWgt-w);
+        }
+    }
+    public void addOneFeature(int fid, ArrayList<Double> S, StringBuilder sb) {
+    	fid = fid-1;
+    	String[] sIndex = sb.toString().split(",");
+    	double intnScore = 0.0;
+//    	System.out.println("fid,S:"+fid+","+S);
+    	for(int k = 0; k < S.size(); k++) {
+    		ArrayList<Double> matrixCol = S_fMatrix.get(Integer.parseInt(sIndex[k])-1);
+//    		System.out.println("matrixCol:"+matrixCol);
+    		double w = matrixCol.get(fid)+S.get(k);
+    		intnScore += matrixCol.get(fid);
+    		S.set(k, w);
+    	}
+    	S.add(intnScore+infeScore.get(fid));
+    }
+    /**
+     * to compute the subgraph density using feature level array-list <code>featIndWgts</code>, i.e., average weight per node
+     * @param edgeWeights the total incoming edge weights of individual feature values
+     * @param featNum the number of features left
+     * @param sb to store the non-relevant feature ids
+     * @return the subgraph density
+     */
+    public double computeDensity(ArrayList<Double> edgeWeights, int featNum) {
+        double density = 0;
+        int len = edgeWeights.size();
+        for(int i = 0; i < len; i++ ) {
+            double w = edgeWeights.get(i);
+            density += w;
+        }
+        density = density / featNum;
+        return density;
+    }
+    
+    /**
+     * to conduct actual feature selection and generate a new data set given a list of non-relevant feature indices
+     * @param data the data set
+     * @param str the non-relevant feature indices
+     * @param path the path for storing the new data set
+     * @param name  name of the data
+     */
+    public void featureSelection(Instances data, String str, String path, String name){
+        
+        BufferedWriter writer = null;
+        Remove remove = new Remove();
+//        System.out.println(str);
+        remove.setAttributeIndices(str);
+//      反向选择
+        remove.setInvertSelection(true);
+        try {
+            remove.setInputFormat(data);
+            Instances newData = Filter.useFilter(data, remove);
+//            File newDir = new File(path+"\\"+name);
+//            if(!newDir.exists())
+//                newDir.mkdir();
+            // System.out.print(String.format(fm, count)+",");
+            int num = 0;
+            if(str.split(",").length>0)
+                num = str.split(",").length - 1;
+            else
+                num = data.numAttributes()-1;
+//            System.out.println(str.split(",").length);
+            writer = new BufferedWriter(new FileWriter(path+"FS_"+name+"_"+(data.numAttributes()-1)+"to"+num+".arff"));
+            writer.write(newData.toString());
+            writer.flush();
+            writer.close();
+            remove.setInputFormat(data);
+        } catch (Exception ex) {
+            Logger.getLogger(SubgraphDiscovery.class.getName()).log(Level.SEVERE, null, ex);
+        }
+        
+    }
+    
+    
+}
